@@ -9,11 +9,22 @@ import simpy
 import numpy as np
 import pandas as pd
 from collections import deque
-
 from PySide6 import QtCore, QtWidgets, QtGui
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+
+
+def calculate_jains_fairness(delays):
+    if not delays:
+        return 1.0
+    n = len(delays)
+    sum_x = sum(delays)
+    sum_x_sq = sum(x*x for x in delays)
+    if sum_x_sq == 0:
+        return 1.0
+    # Jain's Fairness Index: (Sum x)^2 / (n * Sum x^2)
+    return (sum_x ** 2) / (n * sum_x_sq)
 
 # =========================
 # Simulation primitives (same as yours)
@@ -25,20 +36,21 @@ class TraceLog:
         self.events.append({"time": float(env.now), "event": event_type, "pid": pid, "info": info})
 
 class FIFOSemaphore:
-    def __init__(self, env, initial=1, logger=None, ctx_switch=0.0):
+    def __init__(self, env, initial=1, logger=None, ctx_switch=0.0, use_priority_queue = False):
         self.env = env
         self.count = initial
-        self.queue = deque()
+        self.queue = []
         self.logger = logger
         self.op_count = 0
         self.wait_count = 0
         self.ctx_switch = ctx_switch
         self.ql_samples = []
+        self.use_priority = use_priority_queue
 
     def _sample(self):
         self.ql_samples.append((float(self.env.now), len(self.queue)))
 
-    def acquire(self, pid):
+    def acquire(self, pid, priority=0):
         self._sample()
         if self.count > 0 and len(self.queue) == 0:
             self.count -= 1
@@ -47,7 +59,9 @@ class FIFOSemaphore:
             return None
         else:
             ev = self.env.event()
-            self.queue.append((ev, pid, float(self.env.now)))
+            self.queue.append((priority, float(self.env.now), ev, pid))
+            if self.use_priority:
+                self.queue.sort(key=lambda x: (x[0], x[1]))
             self.wait_count += 1
             if self.logger: self.logger.log(self.env, "sem-block", pid, f"pos={len(self.queue)}")
             return ev
@@ -55,7 +69,7 @@ class FIFOSemaphore:
     def release(self, pid):
         self.op_count += 1
         if self.queue:
-            ev, pid_next, tarr = self.queue.popleft()
+            prio, tarr, ev,  pid_next = self.queue.pop(0)
             if self.ctx_switch and self.ctx_switch > 0:
                 def delayed(env, ev):
                     yield env.timeout(self.ctx_switch)
@@ -117,7 +131,7 @@ class Mutex:
         self.env = env
         self.busy = False
         self.owner = None
-        self.queue = deque()
+        self.queue = []
         self.logger = logger
         self.ctx_switch = ctx_switch
         self.op_count = 0
@@ -127,7 +141,7 @@ class Mutex:
     def _sample(self):
         self.ql_samples.append((float(self.env.now), len(self.queue)))
     
-    def acquire(self, pid):
+    def acquire(self, pid, priority=0):
         self._sample()
         if not self.busy and len(self.queue) == 0:
             self.busy = True
@@ -151,7 +165,7 @@ class Mutex:
         self.op_count += 1
 
         if self.queue:
-            ev, nxt = self.queue.popleft()
+            ev, nxt = self.queue.pop(0)
             self.owner = nxt
             if self.ctx_switch > 0:
                 def delayed(env, ev):
@@ -172,6 +186,9 @@ def safe_timeout(env, d):
 # -----------------------
 # Single-run simulation (same signature as before)
 # -----------------------
+# -----------------------
+# Single-run simulation (REVISED)
+# -----------------------
 def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphore_count=1,
                           scheduler="NONE", quantum=1.0, cpu_cores=1, max_cs_per_proc=1,
                           starv_mult=3.0, ctx_switch=0.0, seed=None, use_mutex=False):
@@ -181,10 +198,13 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
 
     env = simpy.Environment()
     logger = TraceLog()
+    use_prio_q = (scheduler == "PRIO")
+    
     if use_mutex:
         sem = Mutex(env, logger=logger, ctx_switch=ctx_switch)
     else:
-        sem = FIFOSemaphore(env, initial=semaphore_count, logger=logger, ctx_switch=ctx_switch)
+        sem = FIFOSemaphore(env, initial=semaphore_count, logger=logger, ctx_switch=ctx_switch, use_priority_queue=use_prio_q)
+    
     cpu = CPU(env, logger, preemptive=(scheduler=="PRIO"), cores=cpu_cores)
 
     wait_times = []
@@ -196,36 +216,44 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
     def process_behavior(pid, runs, priority):
         nonlocal interrupt_count, completed
         for _ in range(runs):
-
             try:
-            # -----------------------------
-            # 1) Acquire semaphore
-            # -----------------------------
+                # -----------------------------
+                # 1) Acquire semaphore
+                # -----------------------------
                 start_wait = float(env.now)
-                acq = sem.acquire(pid)
+                acq = sem.acquire(pid, priority=priority)
                 if acq is not None:
                     try:
                         yield acq
                     except simpy.Interrupt:
                         interrupt_count += 1
-                    # proses kena preempt / dibatalkan → skip iterasi ini
-                        continue
+                        continue # proses kena preempt
 
                 wait = float(env.now - start_wait)
                 wait_times.append(wait)
                 logger.log(env, "enter_cs", pid, f"wait={wait:.6f}")
 
-            # -----------------------------
-            # 2) Critical Section length
-            # -----------------------------
+                # -----------------------------
+                # 2) Critical Section length
+                # -----------------------------
                 cs_len = random.expovariate(1.0 / mean_cs)
                 cs_start = float(env.now)
 
-            # =========================================================
-            # 3) CPU scheduler — semua yield dibungkus interrupt-safe
-            # =========================================================
+                # =========================================================
+                # 3) CPU scheduler 
+                # =========================================================
+                
+                # --- Helper untuk handle interrupt CPU ---
+                def handle_cpu_interrupt(req, core):
+                    nonlocal interrupt_count
+                    interrupt_count += 1
+                    try: cpu.release(core, pid)
+                    except: pass
+                    try: cpu.resource.release(req)
+                    except: pass
+                    sem.release(pid)
 
-            # --- NO SCHEDULER
+                # --- NO SCHEDULER
                 if scheduler == "NONE":
                     try:
                         req = cpu.resource.request()
@@ -233,18 +261,12 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
                         core = cpu.allocate(pid)
                         yield safe_timeout(env, cs_len)
                     except simpy.Interrupt:
-                    # lepas CPU bila ada interrupt
-                        interrupt_count += 1
-                        try: cpu.release(core, pid)
-                        except: pass
-                        try: cpu.resource.release(req)
-                        except: pass
-                        sem.release(pid)
+                        handle_cpu_interrupt(req, core)
                         continue
                     cpu.release(core, pid)
                     cpu.resource.release(req)
 
-            # --- ROUND ROBIN
+                # --- ROUND ROBIN
                 elif scheduler == "RR":
                     remaining = cs_len
                     q = quantum
@@ -257,17 +279,14 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
                             yield safe_timeout(env, run)
                             remaining -= run
                         except simpy.Interrupt:
-                            interrupt_count += 1
-                            try: cpu.release(core, pid)
-                            except: pass
-                            try: cpu.resource.release(req)
-                            except: pass
-                            sem.release(pid)
+                            handle_cpu_interrupt(req, core)
+                            remaining = 0 # break loop
                             continue
                         cpu.release(core, pid)
                         cpu.resource.release(req)
+                    if remaining == 0: pass # normal finish check
 
-            # --- PRIORITY SCHEDULER
+                # --- PRIORITY SCHEDULER
                 elif scheduler == "PRIO":
                     try:
                         req = cpu.resource.request(priority=priority)
@@ -275,17 +294,12 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
                         core = cpu.allocate(pid)
                         yield safe_timeout(env, cs_len)
                     except simpy.Interrupt:
-                        interrupt_count += 1
-                        try: cpu.release(core, pid)
-                        except: pass
-                        try: cpu.resource.release(req)
-                        except: pass
-                        sem.release(pid)
+                        handle_cpu_interrupt(req, core)
                         continue
                     cpu.release(core, pid)
                     cpu.resource.release(req)
 
-            # --- MLFQ
+                # --- MLFQ
                 elif scheduler == "MLFQ":
                     remaining = cs_len
                     quanta = [quantum, quantum * 2, quantum * 4]
@@ -302,19 +316,15 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
                             if remaining > 0 and level < 2:
                                 level += 1
                         except simpy.Interrupt:
-                            interrupt_count += 1
-                            try: cpu.release(core, pid)
-                            except: pass
-                            try: cpu.resource.release(req)
-                            except: pass
-                            sem.release(pid)
+                            handle_cpu_interrupt(req, core)
+                            remaining = 0 
                             continue
                         cpu.release(core, pid)
                         cpu.resource.release(req)
 
-            # -----------------------------
-            # 4) Finish CS
-            # -----------------------------
+                # -----------------------------
+                # 4) Finish CS
+                # -----------------------------
                 cs_end = float(env.now)
                 usage.append(cs_end - cs_start)
                 timeline.append((pid, cs_start, cs_end))
@@ -323,14 +333,12 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
                 sem.release(pid)
                 completed += 1
 
-            # sedikit jeda agar tidak starving
+                # sedikit jeda agar tidak starving
                 yield env.timeout(0.001)
 
             except simpy.Interrupt:
                 interrupt_count += 1
-            # jika ada interrupt dari luar loop
                 continue
-
 
     def generator():
         for i in range(n_process):
@@ -343,6 +351,7 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
     env.process(generator())
     env.run()
 
+    # --- METRICS CALCULATION ---
     total_time = float(env.now)
     avg_wait = float(np.mean(wait_times)) if wait_times else 0.0
     std_wait = float(np.std(wait_times)) if wait_times else 0.0
@@ -350,21 +359,50 @@ def run_simulation_single(n_process=100, mean_arrival=0.5, mean_cs=3.0, semaphor
     total_use = cpu.total_busy()
     cpu_util = total_use / (total_time * cpu_cores) if total_time > 0 else 0.0
     cpu_idle = cpu.total_idle(total_time)
+    
     starv_thr = avg_wait * starv_mult if avg_wait > 0 else 10.0
-    starved = sum(1 for w in wait_times if w > starv_thr)
-    starvation_rate = starved / len(wait_times) if wait_times else 0.0
+    starved_finished = sum(1 for w in wait_times if w > starv_thr)
+    
+    # --- FIX HERE: LOGIKA PENGHITUNGAN STARVATION ANTRIAN ---
+    starved_pending = 0
+    current_now = float(env.now)
+
+    if not use_mutex and hasattr(sem, 'queue'):
+        for item in sem.queue:
+            t_arrival = None
+            
+            # Cek struktur tuple queue
+            if isinstance(item, tuple) and len(item) >= 2:
+                for val in item:
+                    # Cari nilai float (waktu kedatangan)
+                    if isinstance(val, float) and val <= current_now:
+                        t_arrival = val
+                        break
+            
+            # PERBAIKAN: indentasi IF ini harus sejajar di dalam FOR loop
+            if t_arrival is not None:
+                waiting_so_far = current_now - t_arrival
+                if waiting_so_far > starv_thr:
+                    starved_pending += 1
+    # --------------------------------------------------------
+    
+    total_starved = starved_finished + starved_pending
+    starvation_rate = total_starved / n_process if n_process > 0 else 0.0
+
     qlen_samples = sem.ql_samples
     avg_q = float(np.mean([q for _, q in qlen_samples])) if qlen_samples else 0.0
+    fairness_idx = calculate_jains_fairness(wait_times)
 
     result = {
         "avg_wait": avg_wait,
         "std_wait": std_wait,
         "throughput": throughput,
+        "fairness_index": fairness_idx,
         "cpu_util": min(cpu_util, 1.0),
         "cpu_idle": cpu_idle,
         "total_time": total_time,
         "starvation_rate": starvation_rate,
-        "starved_count": int(starved),
+        "starved_count": int(total_starved),
         "wait_times": wait_times,
         "timeline": timeline,
         "trace": logger.events,
@@ -403,57 +441,66 @@ class BatchWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         records = []
+        sync_types = ["Semaphore", "Mutex"]
         total_tasks = len(self.scenarios) * len(self.schedulers) * self.repeats
         done = 0
         for sname, scfg in self.scenarios.items():
             for sched in self.schedulers:
-                for rep in range(self.repeats):
-                    if not self._is_running:
-                        break
-                    cfg = dict(self.base_cfg)
-                    cfg.update(scfg)
-                    # run single sim
-                    seed = self.seed_base + done
-                    res = run_simulation_single(
-                        n_process=cfg["n_process"],
-                        mean_arrival=cfg["mean_arrival"],
-                        mean_cs=cfg["mean_cs"],
-                        semaphore_count=cfg["semaphore_count"],
-                        scheduler=sched,
-                        quantum=cfg.get("quantum", 1.0),
-                        cpu_cores=cfg.get("cpu_cores", 1),
-                        max_cs_per_proc=cfg.get("max_cs_per_process", 1),
-                        starv_mult=cfg.get("starv_mult", 3.0),
-                        ctx_switch=cfg.get("ctx_switch", 0.0),
-                        seed=seed
-                    )
-                    rec = {
-                        "scenario": sname,
-                        "scheduler": sched,
-                        "repeat": rep + 1,
-                        "n_process": cfg["n_process"],
-                        "mean_arrival": cfg["mean_arrival"],
-                        "mean_cs": cfg["mean_cs"],
-                        "semaphore_count": cfg["semaphore_count"],
-                        "avg_wait": res["avg_wait"],
-                        "std_wait": res["std_wait"],
-                        "throughput": res["throughput"],
-                        "cpu_util": res["cpu_util"],
-                        "cpu_idle": res["cpu_idle"],
-                        "starvation_rate": res["starvation_rate"],
-                        "starved_count": res["starved_count"],
-                        "total_time": res["total_time"],
-                        "avg_queue_len": res.get("avg_queue_len", None),
-                        "wait_count": res.get("wait_count", None),
-                        "semaphore_ops": res.get("semaphore_ops", None),
-                        "wait_times": json.dumps(res["wait_times"]),
-                        "timeline": json.dumps(res["timeline"]),
-                        "trace": json.dumps(res["trace"])
-                    }
-                    records.append(rec)
-                    done += 1
-                    pct = int(done / total_tasks * 100)
-                    self.progress.emit(pct)
+                for stype in sync_types:
+                    for rep in range(self.repeats):
+                        if not self._is_running:
+                            break
+                        cfg = dict(self.base_cfg)
+                        cfg.update(scfg)
+    
+                        is_mutex = (stype == "Mutex")
+                        sem_count = 1 if is_mutex else cfg["semaphore_count"]
+    
+                        # run single sim
+                        seed = self.seed_base + done
+                        res = run_simulation_single(
+                            n_process=cfg["n_process"],
+                            mean_arrival=cfg["mean_arrival"],
+                            mean_cs=cfg["mean_cs"],
+                            semaphore_count=cfg["semaphore_count"],
+                            scheduler=sched,
+                            quantum=cfg.get("quantum", 1.0),
+                            cpu_cores=cfg.get("cpu_cores", 1),
+                            max_cs_per_proc=cfg.get("max_cs_per_process", 1),
+                            starv_mult=cfg.get("starv_mult", 3.0),
+                            ctx_switch=cfg.get("ctx_switch", 0.0),
+                            use_mutex=is_mutex,
+                            seed=seed
+                        )
+                        rec = {
+                            "scenario": sname,
+                            "scheduler": sched,
+                            "sync_type": stype,
+                            "repeat": rep + 1,
+                            "n_process": cfg["n_process"],
+                            "mean_arrival": cfg["mean_arrival"],
+                            "mean_cs": cfg["mean_cs"],
+                            "semaphore_count": cfg["semaphore_count"],
+                            "avg_wait": res["avg_wait"],
+                            "fairness_index": res["fairness_index"],
+                            "std_wait": res["std_wait"],
+                            "throughput": res["throughput"],
+                            "cpu_util": res["cpu_util"],
+                            "cpu_idle": res["cpu_idle"],
+                            "starvation_rate": res["starvation_rate"],
+                            "starved_count": res["starved_count"],
+                            "total_time": res["total_time"],
+                            "avg_queue_len": res.get("avg_queue_len", None),
+                            "wait_count": res.get("wait_count", None),
+                            "semaphore_ops": res.get("semaphore_ops", None),
+                            "wait_times": json.dumps(res["wait_times"]),
+                            "timeline": json.dumps(res["timeline"]),
+                            "trace": json.dumps(res["trace"])
+                        }
+                        records.append(rec)
+                        done += 1
+                        pct = int(done / total_tasks * 100)
+                        self.progress.emit(int(done / total_tasks * 100))
         df = pd.DataFrame.from_records(records)
         self.finished.emit(df)
 
@@ -540,12 +587,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tab_gantt = QtWidgets.QWidget(); v1 = QtWidgets.QVBoxLayout(self.tab_gantt)
         self.canvas_gantt = MplCanvas(self, width=8, height=5, dpi=100)
         v1.addWidget(self.canvas_gantt)
+        # --- NEW: Gantt Export Button ---
+        self.btn_save_gantt_svg = QtWidgets.QPushButton("Save Gantt as SVG")
+        v1.addWidget(self.btn_save_gantt_svg)
         self.tabs.addTab(self.tab_gantt, "Gantt (CS segments)")
 
         # Tab 2: Wait Histogram
         self.tab_hist = QtWidgets.QWidget(); v2 = QtWidgets.QVBoxLayout(self.tab_hist)
         self.canvas_hist = MplCanvas(self, width=8, height=4, dpi=100)
         v2.addWidget(self.canvas_hist)
+        # --- NEW: Hist Export Button ---
+        self.btn_save_hist_svg = QtWidgets.QPushButton("Save Histogram as SVG")
+        v2.addWidget(self.btn_save_hist_svg)
         self.tabs.addTab(self.tab_hist, "Wait Time Histogram")
 
         # Tab 3: CPU Util
@@ -578,6 +631,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # signals
         self.btn_run_batch.clicked.connect(self.on_run_batch)
         self.btn_save_batch.clicked.connect(self.on_save_batch)
+        # --- NEW: Connect Export Signals ---
+        self.btn_save_gantt_svg.clicked.connect(self.on_save_gantt_svg)
+        self.btn_save_hist_svg.clicked.connect(self.on_save_hist_svg)
 
         # internal storage
         self.last_result = None
@@ -588,6 +644,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # status bar
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
+        # internal storage (pastikan inisialisasi ini ada)
+        self.last_result = None
 
     # -------------------------
     # Single-run handler
@@ -733,9 +791,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # default scenarios (as agreed)
         scenarios = {
-            "Low": {"n_process": 100, "mean_arrival": 1.0, "mean_cs": 1.0, "semaphore_count": 4},
-            "Medium": {"n_process": 500, "mean_arrival": 0.5, "mean_cs": 3.0, "semaphore_count": 2},
-            "High": {"n_process": 1000, "mean_arrival": 0.2, "mean_cs": 6.0, "semaphore_count": 1}
+            "Low": {"n_process": 15, "mean_arrival": 1.0, "mean_cs": 0.5, "semaphore_count": 3},
+            "Medium": {"n_process": 75, "mean_arrival": 0.5, "mean_cs": 3.0, "semaphore_count": 1},
+            "High": {"n_process": 400, "mean_arrival": 0.2, "mean_cs": 6.0, "semaphore_count": 1}
         }
         schedulers = ["RR", "PRIO", "MLFQ"]
         repeats = 20  # chosen for paper-quality stats
@@ -771,6 +829,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 avg_wait_mean = ("avg_wait", "mean"),
                 avg_wait_std  = ("avg_wait", "std"),
                 throughput_mean = ("throughput", "mean"),
+                fairness_mean = ("fairness_index", "mean"),
+                starvation_mean = ("starvation_rate", "mean"),
                 cpu_util_mean = ("cpu_util", "mean")
             ).reset_index()
             txt = pivot.to_string(index=False, float_format="%.4f")
@@ -800,6 +860,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_batch_df.to_csv(path, index=False)
         QtWidgets.QMessageBox.information(self, "Saved", f"Saved batch CSV to:\n{path}")
 
+    @QtCore.Slot()
+    def on_save_gantt_svg(self):
+        if self.last_result is None or not self.last_result.get("timeline"):
+            QtWidgets.QMessageBox.information(self, "Error", "Run simulation first to generate Gantt data.")
+            return
+
+        # Dapatkan path file dari dialog simpan
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 
+            "Save Gantt Chart as SVG", 
+            "gantt_chart.svg", 
+            "SVG files (*.svg);;All Files (*)"
+        )
+
+        if path:
+            try:
+                # Simpan figur Matplotlib sebagai SVG
+                self.canvas_gantt.figure.savefig(path, format='svg')
+                QtWidgets.QMessageBox.information(self, "Success", f"Gantt Chart saved to:\n{path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error Saving", f"Could not save file:\n{e}")
+
+    @QtCore.Slot()
+    def on_save_hist_svg(self):
+        if self.last_result is None or not self.last_result.get("wait_times"):
+            QtWidgets.QMessageBox.information(self, "Error", "Run simulation first to generate Histogram data.")
+            return
+        
+        # Dapatkan path file dari dialog simpan
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, 
+            "Save Wait Time Histogram as SVG", 
+            "wait_histogram.svg", 
+            "SVG files (*.svg);;All Files (*)"
+        )
+        
+        if path:
+            try:
+                # Simpan figur Matplotlib sebagai SVG
+                self.canvas_hist.figure.savefig(path, format='svg')
+                QtWidgets.QMessageBox.information(self, "Success", f"Wait Time Histogram saved to:\n{path}")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Error Saving", f"Could not save file:\n{e}")
 # =========================
 # run app
 # =========================
